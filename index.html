@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Boule Teams</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; padding: 0; }
+    .wrap { max-width: 780px; margin: 0 auto; padding: 16px; }
+    h1 { font-size: 1.6rem; margin: 12px 0 8px; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+    input[type=text] { padding: 10px 12px; font-size: 1rem; border-radius: 8px; border: 1px solid #999; min-width: 220px; }
+    button { padding: 10px 14px; border-radius: 8px; border: 1px solid #666; cursor: pointer; background: #eee; }
+    ul { list-style: none; padding: 0; margin: 8px 0; }
+    li { padding: 6px 8px; border-bottom: 1px solid #ccc; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+    .card { border: 1px solid #aaa; border-radius: 10px; padding: 12px; }
+    .muted { opacity: .8; font-size: .95rem; }
+    .warn { color: #b30000; }
+    .ok { color: #006400; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Boule Teams</h1>
+    <p class="muted">Enter a name to join; when ready, lock and auto‑split into two teams of up to three players each, with extras put on a waiting list.</p>
+
+    <div class="card">
+      <div class="row">
+        <label class="mono">Room</label>
+        <input id="roomInput" type="text" placeholder="afterwork" />
+        <button id="makeLink">Make invite link</button>
+        <span id="inviteLink" class="muted mono"></span>
+      </div>
+      <p class="muted">Share the invite link so everyone lands in the same room.</p>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <input id="nameInput" type="text" placeholder="Name" maxlength="24" />
+        <button id="joinBtn">Join</button>
+      </div>
+      <p class="muted">Names sync in realtime for everyone in this room.</p>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <h3>Participants (<span id="count">0</span>)</h3>
+        <ul id="players"></ul>
+        <div class="row">
+          <button id="lockBtn" title="Randomize and freeze teams">Lock & Create Teams</button>
+          <span id="lockHint" class="muted">Requires at least 2 names.</span>
+        </div>
+      </div>
+
+      <div id="teamsBox" class="card" style="display:none">
+        <h3>Teams</h3>
+        <div class="grid">
+          <div>
+            <h4>Team A</h4>
+            <ul id="teamA"></ul>
+          </div>
+          <div>
+            <h4>Team B</h4>
+            <ul id="teamB"></ul>
+          </div>
+        </div>
+        <h4>Waiting</h4>
+        <ul id="subs"></ul>
+      </div>
+    </div>
+
+    <p class="muted">Tip: Use distinct first names or add initials to avoid duplicates.</p>
+    <p id="statusText" class="muted"></p>
+  </div>
+
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-app.js";
+    import {
+      getDatabase, ref, push, set, onValue, update, serverTimestamp, child, get
+    } from "https://www.gstatic.com/firebasejs/10.13.1/firebase-database.js";
+
+    // 1) Replace with Firebase config from the console (Project settings → Web app)
+    //    Ensure databaseURL matches the Realtime Database instance.
+    const firebaseConfig = {
+      apiKey: "PASTE_API_KEY",
+      authDomain: "YOUR_PROJECT.firebaseapp.com",
+      databaseURL: "https://YOUR_DB_ID.europe-west1.firebasedatabase.app",
+      projectId: "YOUR_PROJECT",
+      storageBucket: "YOUR_PROJECT.appspot.com",
+      messagingSenderId: "000000000000",
+      appId: "1:000000000000:web:xxxxxxxxxxxxxxxx"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    // Room handling via URL param (?room=afterwork-2025-09-25) with sensible default
+    const params = new URLSearchParams(location.search);
+    let room = (params.get("room") || "afterwork").trim();
+    const roomRef    = ref(db, `rooms/${room}`);
+    const playersRef = ref(db, `rooms/${room}/players`);
+    const teamsRef   = ref(db, `rooms/${room}/teams`);
+    const lockedRef  = ref(db, `rooms/${room}/locked`);
+
+    // Invite link maker
+    const roomInput  = document.getElementById("roomInput");
+    const makeLink   = document.getElementById("makeLink");
+    const inviteLink = document.getElementById("inviteLink");
+    roomInput.value = room;
+    makeLink.addEventListener("click", () => {
+      const code = roomInput.value.trim() || "afterwork";
+      const link = `${location.origin}${location.pathname}?room=${encodeURIComponent(code)}`;
+      inviteLink.textContent = link;
+      navigator.clipboard?.writeText(link).catch(()=>{});
+    });
+
+    // Join (add name)
+    const nameInput = document.getElementById("nameInput");
+    const joinBtn   = document.getElementById("joinBtn");
+    joinBtn.addEventListener("click", async () => {
+      const name = nameInput.value.trim();
+      if (!name) return;
+      // Add with server timestamp
+      await set(push(playersRef), { name, ts: serverTimestamp() });
+      nameInput.value = "";
+    });
+
+    // Live participants list
+    const playersList = document.getElementById("players");
+    const countSpan   = document.getElementById("count");
+    const statusText  = document.getElementById("statusText");
+    onValue(playersRef, (snap) => {
+      const data = snap.val() || {};
+      const list = Object.values(data).map(p => ({ name: String(p.name || "").trim() }))
+        .filter(p => p.name);
+      // Sort by name for neatness
+      list.sort((a,b) => a.name.localeCompare(b.name));
+      // Render
+      playersList.innerHTML = "";
+      countSpan.textContent = String(list.length);
+      for (const p of list) {
+        const li = document.createElement("li");
+        li.textContent = p.name;
+        playersList.appendChild(li);
+      }
+      statusText.textContent = list.length > 6
+        ? "More than 6 joined: extras will appear in Waiting after teams are created."
+        : "";
+    });
+
+    // Lock and create teams (max 3 per team; extras go to Waiting)
+    const teamsBox = document.getElementById("teamsBox");
+    const teamAList = document.getElementById("teamA");
+    const teamBList = document.getElementById("teamB");
+    const subsList  = document.getElementById("subs");
+    const lockBtn   = document.getElementById("lockBtn");
+
+    lockBtn.addEventListener("click", async () => {
+      const snap = await get(playersRef);
+      const raw = snap.val() || {};
+      let players = Object.values(raw)
+        .map(p => ({ name: String(p.name || "").trim() }))
+        .filter(p => p.name);
+
+      // De‑duplicate by lowercase name
+      const seen = new Set();
+      players = players.filter(p => {
+        const k = p.name.toLowerCase();
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+
+      if (players.length < 2) return;
+
+      // Fisher–Yates shuffle
+      for (let i = players.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [players[i], players[j]] = [players[j], players[i]];
+      }
+
+      const selected = players.slice(0, Math.min(6, players.length));
+      const subs = players.slice(6).map(p => p.name);
+
+      const teamA = [];
+      const teamB = [];
+      for (const p of selected) {
+        if (teamA.length < 3 && (teamB.length >= 3 || teamA.length <= teamB.length)) {
+          teamA.push(p.name);
+        } else {
+          teamB.push(p.name);
+        }
+      }
+
+      await update(roomRef, { locked: true, teams: { teamA, teamB, subs } });
+    });
+
+    // UI reacts to locked state
+    onValue(lockedRef, (snap) => {
+      const locked = !!snap.val();
+      joinBtn.disabled   = locked;
+      nameInput.disabled = locked;
+      lockBtn.disabled   = locked;
+    });
+
+    // Render teams live
+    onValue(teamsRef, (snap) => {
+      const t = snap.val();
+      if (!t) { teamsBox.style.display = "none"; return; }
+      teamsBox.style.display = "";
+      teamAList.innerHTML = "";
+      teamBList.innerHTML = "";
+      subsList.innerHTML  = "";
+      (t.teamA || []).forEach(n => { const li = document.createElement("li"); li.textContent = n; teamAList.appendChild(li); });
+      (t.teamB || []).forEach(n => { const li = document.createElement("li"); li.textContent = n; teamBList.appendChild(li); });
+      (t.subs  || []).forEach(n => { const li = document.createElement("li"); li.textContent = n; subsList.appendChild(li); });
+    });
+  </script>
+</body>
+</html>
